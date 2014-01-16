@@ -139,9 +139,9 @@ PUBLIC void httpInitAuth(Http *http)
     httpAddAuthType("basic", httpBasicLogin, httpBasicParse, httpBasicSetHeaders);
     httpAddAuthType("digest", httpDigestLogin, httpDigestParse, httpDigestSetHeaders);
     httpAddAuthType("form", formLogin, NULL, NULL);
+    httpAddAuthStore("app", NULL);
 
 #if BIT_HAS_PAM && BIT_HTTP_PAM
-    httpAddAuthStore("app", NULL);
     httpAddAuthStore("system", httpPamVerifyUser);
 #endif
     httpAddAuthStore("internal", fileVerifyUser);
@@ -1770,7 +1770,7 @@ PUBLIC ssize httpFilterChunkData(HttpQueue *q, HttpPacket *packet)
         start = mprGetBufStart(buf);
         bad = (start[0] != '\r' || start[1] != '\n');
         for (cp = &start[2]; cp < buf->end && *cp != '\n'; cp++) {}
-        if (*cp != '\n' && (cp - start) < 80) {
+        if (cp >= buf->end || (*cp != '\n' && (cp - start) < 80)) {
             return 0;
         }
         bad += (cp[-1] != '\r' || cp[0] != '\n');
@@ -2793,10 +2793,11 @@ PUBLIC MprSocket *httpStealConn(HttpConn *conn)
 {
     MprSocket   *sock;
 
-    sock = conn->sock;
+    if ((sock = conn->sock) != 0) {
+        mprRemoveSocketHandler(sock);
+    }
     conn->sock = 0;
 
-    mprRemoveSocketHandler(conn->sock);
     if (conn->http) {
         lock(conn->http);
         httpRemoveConn(conn->http, conn);
@@ -7239,7 +7240,6 @@ PUBLIC HttpPacket *httpResizePacket(HttpQueue *q, HttpPacket *packet, ssize size
          */
         len = packet->content ? httpGetPacketLength(packet) : 0;
         size = min(size, len);
-        size = min(size, q->nextQ->max);
         size = min(size, q->nextQ->packetSize);
         if (size == 0 || size == len) {
             return 0;
@@ -8549,9 +8549,7 @@ PUBLIC bool httpWillNextQueueAcceptPacket(HttpQueue *q, HttpPacket *packet)
     if (size <= nextQ->packetSize && (size + nextQ->count) <= nextQ->max) {
         return 1;
     }
-    if (httpResizePacket(q, packet, 0) < 0) {
-        return 0;
-    }
+    httpResizePacket(q, packet, 0);
     size = httpGetPacketLength(packet);
     assert(size <= nextQ->packetSize);
     /* 
@@ -8583,9 +8581,7 @@ PUBLIC bool httpWillQueueAcceptPacket(HttpQueue *q, HttpPacket *packet, bool spl
         return 1;
     }
     if (split) {
-        if (httpResizePacket(q, packet, 0) < 0) {
-            return 0;
-        }
+        httpResizePacket(q, packet, 0);
         size = httpGetPacketLength(packet);
         assert(size <= q->packetSize);
         if ((size + q->count) <= q->max) {
@@ -9694,7 +9690,9 @@ static int checkRoute(HttpConn *conn, HttpRoute *route)
     if ((rc = (*proc)(conn, route, 0)) != HTTP_ROUTE_OK) {
         return rc;
     }
-    if (tx->handler->rewrite) {
+    if (tx->finalized) {
+        tx->handler = conn->http->passHandler;
+    } else if (tx->handler->rewrite) {
         rc = tx->handler->rewrite(conn);
     }
     return rc;
@@ -9771,6 +9769,14 @@ PUBLIC void httpMapFile(HttpConn *conn, HttpRoute *route)
     tx->filename = mprJoinPath(route->documents, tx->filename);
 #if BIT_ROM
     tx->filename = mprGetRelPath(tx->filename, NULL);
+#endif
+#if BIT_WIN_LIKE || BIT_EXTRA_SECURITY
+    if (!mprIsParentPathOf(route->documents, tx->filename)) {
+        info->checked = 1;
+        info->valid = 0;
+        httpError(conn, HTTP_CODE_BAD_REQUEST, "Bad URL");
+        return;
+    }
 #endif
     /*
         Change the filename if using mapping. Typically used to prefer compressed or minified content.
@@ -13955,8 +13961,9 @@ static int setParsedUri(HttpConn *conn)
 
     rx = conn->rx;
     if (httpSetUri(conn, rx->uri) < 0 || rx->pathInfo[0] != '/') {
-        httpBadRequestError(conn, HTTP_ABORT | HTTP_CODE_BAD_REQUEST, "Bad URL");
-        return MPR_ERR_BAD_ARGS;
+        httpBadRequestError(conn, HTTP_CODE_BAD_REQUEST, "Bad URL");
+        rx->parsedUri = httpCreateUri("", 0);
+        /* Continue to render a response */
     }
     /*
         Complete the URI based on the connection state.
@@ -13985,8 +13992,7 @@ PUBLIC int httpSetUri(HttpConn *conn, cchar *uri)
     if ((rx->parsedUri = httpCreateUri(uri, 0)) == 0) {
         return MPR_ERR_BAD_ARGS;
     }
-    pathInfo = httpNormalizeUriPath(mprUriDecode(rx->parsedUri->path));
-    if (pathInfo[0] != '/') {
+    if ((pathInfo = httpValidateUriPath(rx->parsedUri->path)) == 0) {
         return MPR_ERR_BAD_ARGS;
     }
     rx->pathInfo = pathInfo;
@@ -17750,20 +17756,20 @@ PUBLIC char *httpNormalizeUriPath(cchar *pathArg)
         if (sp[0] == '.') {
             if (sp[1] == '\0')  {
                 if ((i+1) == nseg) {
+                    /* Trim trailing "." */
                     segments[j] = "";
                 } else {
+                    /* Trim intermediate "." */
                     j--;
                 }
             } else if (sp[1] == '.' && sp[2] == '\0')  {
-                if (i == 1 && *segments[0] == '\0') {
-                    j = 0;
-                } else if ((i+1) == nseg) {
-                    if (--j >= 0) {
-                        segments[j] = "";
-                    }
-                } else {
-                    j = max(j - 2, -1);
+                j = max(j - 2, -1);
+                if ((i+1) == nseg) {
+                    nseg--;
                 }
+            } else {
+                /* ..more-chars */
+                segments[j] = segments[i];
             }
         } else {
             segments[j] = segments[i];
@@ -17941,6 +17947,49 @@ PUBLIC char *httpLink(HttpConn *conn, cchar *target, MprHash *options)
 PUBLIC char *httpUriToString(HttpUri *uri, int flags)
 {
     return httpFormatUri(uri->scheme, uri->host, uri->port, uri->path, uri->reference, uri->query, flags);
+}
+
+
+/*
+    Validate a URI path for use in a HTTP request line
+    The URI must contain only valid characters and must being with "/" both before and after decoding.
+    A decoded, normalized URI path is returned.
+ */
+PUBLIC char *httpValidateUriPath(cchar *uri)
+{
+    char    *up;
+
+    if (*uri != '/') {
+        return 0;
+    }
+    if (!httpValidUriChars(uri)) {
+        return 0;
+    }
+    up = mprUriDecode(uri);
+    up = httpNormalizeUriPath(up);
+    if (*up != '/') {
+        return 0;
+    }
+    return up;
+}
+
+
+/*
+    This tests if the URI has only characters valid to use in a URI before decoding. i.e. It will permit %NN encodings.
+ */
+PUBLIC bool httpValidUriChars(cchar *uri)
+{
+    ssize   pos;
+
+    if (uri == 0 || *uri == 0) {
+        return 1;
+    }
+    pos = strspn(uri, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[]@!$&'()*+,;=%");
+    if (pos < slen(uri)) {
+        mprTrace(3, "Bad character in URI at %s", &uri[pos]);
+        return 0;
+    }
+    return 1;
 }
 
 

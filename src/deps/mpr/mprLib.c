@@ -2400,6 +2400,7 @@ PUBLIC Mpr *mprCreate(int argc, char **argv, int flags)
     fs = mprCreateFileSystem("/");
     mprAddFileSystem(fs);
     mprCreateLogService();
+    mprCreateCacheService();
 
     if (argv) {
 #if BIT_WIN_LIKE
@@ -4332,6 +4333,14 @@ static void pruneCache(MprCache *cache, MprEvent *event);
 static void removeItem(MprCache *cache, CacheItem *item);
 
 /************************************* Code ***********************************/
+
+PUBLIC int mprCreateCacheService()
+{
+    shared = 0;
+    return 0;
+}
+
+
 
 PUBLIC MprCache *mprCreateCache(int options)
 {
@@ -14283,7 +14292,7 @@ PUBLIC MprMutex *mprCreateLock()
 #elif WINCE
     InitializeCriticalSection(&lock->cs);
 #elif BIT_WIN_LIKE
-    InitializeCriticalSectionAndSpinCount(&lock->cs, 5000);
+    InitializeCriticalSectionAndSpinCount(&lock->cs, BIT_MPR_SPIN_COUNT);
 #elif VXWORKS
     /* Removed SEM_INVERSION_SAFE */
     lock->cs = semMCreate(SEM_Q_PRIORITY | SEM_DELETE_SAFE);
@@ -14303,8 +14312,8 @@ static void manageLock(MprMutex *lock, int flags)
 #if BIT_UNIX_LIKE
         pthread_mutex_destroy(&lock->cs);
 #elif BIT_WIN_LIKE
+        lock->freed = 1;
         DeleteCriticalSection(&lock->cs);
-        lock->cs.SpinCount = 0;
 #elif VXWORKS
         semDelete(lock->cs);
 #endif
@@ -14325,7 +14334,7 @@ PUBLIC MprMutex *mprInitLock(MprMutex *lock)
     InitializeCriticalSection(&lock->cs);
 
 #elif BIT_WIN_LIKE
-    InitializeCriticalSectionAndSpinCount(&lock->cs, 5000);
+    InitializeCriticalSectionAndSpinCount(&lock->cs, BIT_MPR_SPIN_COUNT);
 
 #elif VXWORKS
     /* Removed SEM_INVERSION_SAFE */
@@ -14351,8 +14360,7 @@ PUBLIC bool mprTryLock(MprMutex *lock)
 #if BIT_UNIX_LIKE
     rc = pthread_mutex_trylock(&lock->cs) != 0;
 #elif BIT_WIN_LIKE
-    /* Rely on SpinCount being non-zero */
-    if (lock->cs.SpinCount) {
+    if (!lock->freed) {
         rc = TryEnterCriticalSection(&lock->cs) == 0;
     } else {
         rc = 0;
@@ -14389,8 +14397,8 @@ PUBLIC void mprManageSpinLock(MprSpin *lock, int flags)
 #elif BIT_UNIX_LIKE
         pthread_mutex_destroy(&lock->cs);
 #elif BIT_WIN_LIKE
+        lock->freed = 1;
         DeleteCriticalSection(&lock->cs);
-        lock->cs.SpinCount = 0;
 #elif VXWORKS
         semDelete(lock->cs);
 #endif
@@ -14421,7 +14429,7 @@ PUBLIC MprSpin *mprInitSpinLock(MprSpin *lock)
 #elif WINCE
     InitializeCriticalSection(&lock->cs);
 #elif BIT_WIN_LIKE
-    InitializeCriticalSectionAndSpinCount(&lock->cs, 5000);
+    InitializeCriticalSectionAndSpinCount(&lock->cs, BIT_MPR_SPIN_COUNT);
 #elif VXWORKS
     #if FUTURE
         spinLockTaskInit(&lock->cs, 0);
@@ -14459,8 +14467,7 @@ PUBLIC bool mprTrySpinLock(MprSpin *lock)
 #elif BIT_UNIX_LIKE
     rc = pthread_mutex_trylock(&lock->cs) != 0;
 #elif BIT_WIN_LIKE
-    /* Rely on SpinCount being non-zero */
-    if (lock->cs.SpinCount) {
+    if (!lock->freed) {
         rc = TryEnterCriticalSection(&lock->cs) == 0;
     } else {
         rc = 0;
@@ -14516,8 +14523,7 @@ PUBLIC void mprLock(MprMutex *lock)
 #if BIT_UNIX_LIKE
     pthread_mutex_lock(&lock->cs);
 #elif BIT_WIN_LIKE
-    /* Rely on SpinCount being non-zero */
-    if (lock->cs.SpinCount) {
+    if (!lock->freed) {
         EnterCriticalSection(&lock->cs);
     }
 #elif VXWORKS
@@ -14569,7 +14575,7 @@ PUBLIC void mprSpinLock(MprSpin *lock)
 #elif BIT_UNIX_LIKE
     pthread_mutex_lock(&lock->cs);
 #elif BIT_WIN_LIKE
-    if (lock->cs.SpinCount) {
+    if (!lock->freed) {
         EnterCriticalSection(&lock->cs);
     }
 #elif VXWORKS
